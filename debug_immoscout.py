@@ -7,8 +7,8 @@ and dumps all form fields — so we can update selectors in immoscout_scraper.py
 """
 import asyncio
 from pathlib import Path
-from src.config import load_config
-from src.immoscout_scraper import ImmoscoutScraper, IMMOSC_BASE
+from src.utils.config import load_config
+from src.immoscout.scraper import ImmoscoutScraper, IMMOSC_BASE
 from playwright.async_api import async_playwright
 
 PROFILE_DIR = Path("browser_profile_immoscout")

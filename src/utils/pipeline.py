@@ -73,5 +73,4 @@ class MessagePipeline:
         if "---ENGLISH---" in raw:
             german, english = raw.split("---ENGLISH---", 1)
             return german.strip(), english.strip()
-        # Fallback: treat full response as German, no English preview
         return raw, raw

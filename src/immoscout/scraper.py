@@ -7,8 +7,10 @@ from typing import Optional
 import anthropic
 from playwright.async_api import Page
 
-from .config import AppConfig
-from .models import Listing
+from ..utils.browser import BaseScraper
+from ..utils.config import AppConfig
+from ..utils.models import Listing
+from ..utils.parsing import requires_wbs, parse_german_number, parse_facts
 
 IMMOSC_BASE = "https://www.immobilienscout24.de"
 _SIGNIN_DOMAIN = "sso.immobilienscout24.de"
@@ -47,10 +49,9 @@ _PREMIUM_PHRASES = (
 )
 
 
-class ImmoscoutScraper:
+class ImmoscoutScraper(BaseScraper):
     def __init__(self, page: Page, config: AppConfig):
-        self.page = page
-        self.config = config
+        super().__init__(page, config)
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -73,12 +74,10 @@ class ImmoscoutScraper:
         except Exception:
             pass
 
-        # Already logged in → account link led to the dashboard.
         if "meinkonto" in self.page.url or "dashboard" in self.page.url:
             print("[login] Already logged in.")
             return True
 
-        # Not on SSO yet — navigate there directly.
         if _SIGNIN_DOMAIN not in self.page.url:
             print(f"[login] Unexpected URL {self.page.url!r}, navigating to SSO directly…")
             await self.page.goto(_LOGIN_URL, wait_until="domcontentloaded")
@@ -90,7 +89,6 @@ class ImmoscoutScraper:
 
         await self._accept_cookies()
 
-        # Enter email
         email_field = self.page.locator(
             'input[name="username"], input[type="email"], input[id="username"]'
         ).first
@@ -108,7 +106,6 @@ class ImmoscoutScraper:
         try:
             await password_field.wait_for(state="visible", timeout=2000)
         except Exception:
-            # Password not visible yet — need to advance the form
             await self._click_first([
                 'button[type="submit"]:has-text("Weiter")',
                 'button:has-text("Weiter")',
@@ -117,7 +114,6 @@ class ImmoscoutScraper:
             await self._delay(1000, 2000)
             await self._handle_otp_if_present()
 
-        # Enter password
         try:
             await password_field.wait_for(state="visible", timeout=10000)
         except Exception:
@@ -127,7 +123,6 @@ class ImmoscoutScraper:
         await self._human_type(password_field, self.config.password)
         await self._delay(1000, 2000)
 
-        # Find and click the submit button — try every plausible selector.
         submit_selectors = [
             'button[type="submit"]:has-text("Anmelden")',
             'button:has-text("Anmelden")',
@@ -154,7 +149,6 @@ class ImmoscoutScraper:
 
         if not clicked:
             print(f"[login] No submit button found. Current URL: {self.page.url}")
-            # Dump all buttons on the page so we can add the right selector
             buttons = await self.page.locator("button").all()
             for btn in buttons:
                 try:
@@ -165,7 +159,6 @@ class ImmoscoutScraper:
 
         await self._handle_otp_if_present()
 
-        # Wait until we land on the main site (not any auth subdomain).
         try:
             await self.page.wait_for_url(
                 lambda url: url.startswith("https://www.immobilienscout24.de"),
@@ -233,7 +226,6 @@ class ImmoscoutScraper:
         await self.page.evaluate(f"window.scrollBy(0, {random.randint(200, 500)})")
         await self._delay(1000, 2000)
 
-        # Check for premium/paid-plan gate before doing anything else.
         if await self.page.locator(PREMIUM_WALL).count():
             listing.premium_only = True
             return listing
@@ -245,7 +237,7 @@ class ImmoscoutScraper:
         try:
             desc = await self.page.locator(DESCRIPTION_SELECTOR).inner_text(timeout=5000)
             listing.description = desc.strip()
-            if _requires_wbs(listing.description):
+            if requires_wbs(listing.description):
                 listing.wbs_required = True
         except Exception:
             pass
@@ -254,12 +246,10 @@ class ImmoscoutScraper:
     async def apply(self, listing: Listing, message: str) -> bool:
         base_url = listing.url.split("#")[0]
 
-        # --- 1. Open the contact form ---
         container = await self._open_contact_form(base_url, listing.id)
         if container is None:
             return False
 
-        # --- 2. Find the message textarea ---
         msg_field = container.locator('textarea[name="message"], textarea').first
         try:
             await msg_field.wait_for(state="visible", timeout=5000)
@@ -270,12 +260,10 @@ class ImmoscoutScraper:
             await self._dump_form_fields(container)
             return False
 
-        # --- 3. Fill message ---
         await msg_field.fill("")
         await msg_field.fill(message)
         await self._delay(300, 600)
 
-        # --- 4. Fill standard personal fields ---
         u = self.config.user
         parts = u.name.split(" ", 1)
         for field_name, value in [
@@ -296,7 +284,7 @@ class ImmoscoutScraper:
             except Exception:
                 pass
 
-        # --- 5. IS24-specific structured fields (optional; varies per listing) ---
+        # IS24-specific structured fields (optional; varies per listing)
         await self._fill_select(container, "salutation", ["Herr"])
         if u.household_size:
             await self._fill_input_if_empty(container, "numberOfAdults", str(u.household_size))
@@ -320,10 +308,9 @@ class ImmoscoutScraper:
         if u.city:
             await self._fill_input_if_empty(container, "city", u.city)
 
-        # --- 6. Accept privacy policy (required — IS24 API rejects with ERROR_RESOURCE_VALIDATION if false) ---
+        # Accept privacy policy (required — IS24 API rejects with ERROR_RESOURCE_VALIDATION if false)
         await self._accept_privacy_policy(container)
 
-        # --- 7. Tick "share my profile" checkbox if present ---
         try:
             cb_frame = container.locator('[data-testid="checkbox-frame"]').first
             if await cb_frame.is_visible(timeout=2000):
@@ -337,11 +324,9 @@ class ImmoscoutScraper:
         except Exception:
             pass
 
-        # --- 8. Fill any remaining unknown fields via Claude ---
         await self._fill_extra_fields(container)
         await self._delay(800, 2000)
 
-        # --- 8. Submit ---
         # IS24's React form initialises privacyPolicyAccepted=false and there is no
         # DOM checkbox that sets it to true — intercept the POST and patch it.
         expose_pattern = f"**/expose/{listing.id}"
@@ -396,12 +381,10 @@ class ImmoscoutScraper:
             await self._dump_form_fields(container)
             return False
 
-        # --- 9. Verify the form was actually accepted ---
         await self._delay(2500, 3500)
         await self.page.unroute(expose_pattern, _patch_and_log)
         self.page.remove_listener("response", _capture_response)
 
-        # Log errors from IS24's API.
         for status, url, body in api_responses:
             short_url = url.split("?")[0][-80:]
             if status >= 400 or "error" in body.lower() or "fehler" in body.lower():
@@ -422,7 +405,6 @@ class ImmoscoutScraper:
 
     async def _open_contact_form(self, base_url: str, listing_id: str):
         """Navigate to the contact modal and return its container locator, or None."""
-        # IS24 supports multiple hash routes depending on listing type.
         for hash_suffix in ["#/basicContact/email", "#/contact/email", "#/basicContact/", ""]:
             url = base_url + hash_suffix
             print(f"[apply] Trying contact URL: {url}")
@@ -434,7 +416,6 @@ class ImmoscoutScraper:
                 print(f"[apply] Suchen+ required — skipping {listing_id}")
                 return None
 
-            # Try modal first, then inline contact form.
             for container_sel in [CONTACT_MODAL, CONTACT_FORM]:
                 loc = self.page.locator(container_sel).first
                 try:
@@ -445,7 +426,6 @@ class ImmoscoutScraper:
                     pass
 
             if hash_suffix == "":
-                # Last resort: click a visible contact/Anfrage button on the page.
                 clicked = await self._click_first([
                     'button:has-text("Kontakt aufnehmen")',
                     'button:has-text("Anfrage senden")',
@@ -485,16 +465,14 @@ class ImmoscoutScraper:
             except Exception:
                 pass
 
-        # Success also shows as the modal/form disappearing.
         try:
             still_visible = await container.is_visible(timeout=1000)
             if not still_visible:
                 print(f"[apply] Container gone after submit — treating as success")
                 return True
         except Exception:
-            return True  # locator threw → element no longer in DOM
+            return True
 
-        # Dump any validation error text to help diagnose.
         try:
             errors = await self.page.locator(
                 '[data-testid*="error"], [class*="error"], [class*="validation"], '
@@ -515,7 +493,6 @@ class ImmoscoutScraper:
         privacyPolicyAccepted=false.  The checkbox is often hidden or unlabelled so
         we try several strategies in order.
         """
-        # 1. Direct name-based lookup
         for name in ["privacyPolicyAccepted", "privacy", "datenschutz", "agb"]:
             try:
                 cb = container.locator(f'input[type="checkbox"][name="{name}"]').first
@@ -528,7 +505,6 @@ class ImmoscoutScraper:
             except Exception:
                 pass
 
-        # 2. Label text lookup
         for phrase in ["Datenschutz", "Nutzungsbedingungen", "privacy", "AGB", "Einwilligung"]:
             try:
                 label = container.locator(f'label:has-text("{phrase}")').first
@@ -545,7 +521,6 @@ class ImmoscoutScraper:
             except Exception:
                 pass
 
-        # 3. JS: locate by name/id attribute, fire React-compatible events
         try:
             accepted = await container.evaluate("""el => {
                 const cbs = el.querySelectorAll('input[type="checkbox"]');
@@ -626,15 +601,15 @@ class ImmoscoutScraper:
         if listing.premium_only and not f.apply_premium:
             return False
         if listing.rent and listing.rent != "Preis auf Anfrage":
-            rent_val = _parse_german_number(listing.rent)
+            rent_val = parse_german_number(listing.rent)
             if rent_val is not None and rent_val > f.max_rent:
                 return False
         if listing.size:
-            size_val = _parse_german_number(listing.size)
+            size_val = parse_german_number(listing.size)
             if size_val is not None and size_val < f.min_size:
                 return False
         if listing.rooms:
-            rooms_val = _parse_german_number(listing.rooms)
+            rooms_val = parse_german_number(listing.rooms)
             if rooms_val is not None and rooms_val < f.min_rooms:
                 return False
         return True
@@ -669,7 +644,6 @@ class ImmoscoutScraper:
                         if (seen.has(id)) return;
                         seen.add(id);
 
-                        // Walk up to find the card wrapper
                         let card = a.parentElement;
                         for (let i = 0; i < 10 && card; i++) {
                             if (card.querySelector('[data-testid="headline"]') ||
@@ -706,7 +680,7 @@ class ImmoscoutScraper:
 
         listings: list[Listing] = []
         for item in raw:
-            rooms, size = _parse_facts(item.get("facts", ""))
+            rooms, size = parse_facts(item.get("facts", ""))
             rent_m = re.search(r"([\d.,]+)\s*€", item.get("facts", ""))
             rent = rent_m.group(0) if rent_m else "Preis auf Anfrage"
             title = item.get("title") or f"Inserat {item['id']}"
@@ -718,7 +692,7 @@ class ImmoscoutScraper:
                 size=size,
                 rooms=rooms,
                 address=item.get("address") or "Berlin",
-                wbs_required=_requires_wbs(title),
+                wbs_required=requires_wbs(title),
                 premium_only=bool(item.get("premium")),
             ))
 
@@ -743,7 +717,6 @@ class ImmoscoutScraper:
             except Exception:
                 continue
 
-        # Shadow DOM fallback
         try:
             accepted = await self.page.evaluate("""
                 () => {
@@ -904,7 +877,6 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
                         await sel.select_option(value=opt["v"])
                         await self._delay(200, 500)
                         return
-            # Fallback: first non-empty option
             for opt in options:
                 if opt["v"]:
                     await sel.select_option(value=opt["v"])
@@ -950,17 +922,6 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
             except Exception:
                 continue
 
-    async def _click_first(self, selectors: list[str]) -> bool:
-        for sel in selectors:
-            try:
-                el = self.page.locator(sel).first
-                if await el.is_visible(timeout=3000):
-                    await el.click()
-                    return True
-            except Exception:
-                continue
-        return False
-
     @staticmethod
     async def _text(locator, selector: str) -> str:
         try:
@@ -968,21 +929,6 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
         except Exception:
             return ""
 
-    @staticmethod
-    async def _delay(min_ms: int = 600, max_ms: int = 1400) -> None:
-        await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
-
-    @staticmethod
-    async def _human_type(field, text: str) -> None:
-        await field.click()
-        for ch in text:
-            await field.type(ch)
-            await asyncio.sleep(random.uniform(0.06, 0.18))
-
-
-# ------------------------------------------------------------------ #
-# Module-level helpers (mirrors immowelt scraper)                     #
-# ------------------------------------------------------------------ #
 
 def _extract_title(raw: str) -> str:
     lines = [l.strip() for l in raw.splitlines() if l.strip() and l.strip() != "·"]
@@ -994,43 +940,3 @@ def _extract_title(raw: str) -> str:
         if not re.match(r'^[\d.,\s€m²]+$', line) and line not in ("Kaltmiete", "Warmmiete"):
             return line
     return lines[0] if lines else raw.strip()
-
-
-_WBS_NOT_REQUIRED = re.compile(
-    r"kein\w*\s+WBS"
-    r"|ohne\s+WBS"
-    r"|WBS\s+(?:ist\s+)?nicht\s+\w+"
-    r"|kein\w*\s+Wohnberechtigungsschein"
-    r"|ohne\s+Wohnberechtigungsschein",
-    re.IGNORECASE,
-)
-_WBS_REQUIRED = re.compile(r"\bWBS\b|Wohnberechtigungsschein", re.IGNORECASE)
-
-
-def _requires_wbs(text: str) -> bool:
-    if _WBS_NOT_REQUIRED.search(text):
-        return False
-    return bool(_WBS_REQUIRED.search(text))
-
-
-def _parse_german_number(text: str) -> Optional[float]:
-    m = re.search(r"([\d]+(?:\.[\d]{3})*(?:,[\d]+)?)", text)
-    if not m:
-        return None
-    raw = m.group(1).replace(".", "").replace(",", ".")
-    try:
-        return float(raw)
-    except ValueError:
-        return None
-
-
-def _parse_facts(text: str) -> tuple[str, str]:
-    rooms = ""
-    size = ""
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:Zi\b|Zimmer)", text)
-    if m:
-        rooms = m.group(1)
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", text)
-    if m:
-        size = f"{m.group(1)} m²"
-    return rooms, size

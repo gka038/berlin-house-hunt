@@ -6,8 +6,8 @@ each stage so we can update the selectors in scraper.py.
 """
 import asyncio
 from pathlib import Path
-from src.config import load_config
-from src.scraper import ImmoweltScraper, IMMOWELT_BASE
+from src.utils.config import load_config
+from src.immowelt.scraper import ImmoweltScraper, IMMOWELT_BASE
 from playwright.async_api import async_playwright
 
 PROFILE_DIR = Path("browser_profile")

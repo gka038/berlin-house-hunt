@@ -12,8 +12,8 @@ dependencies = [
 ]
 
 [project.scripts]
-immowelt = "src.main:run"
-immoscout = "src.immoscout_main:run"
+immowelt = "src.immowelt.main:run"
+immoscout = "src.immoscout.main:run"
 
 [build-system]
 requires = ["setuptools>=68"]

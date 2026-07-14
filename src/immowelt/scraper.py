@@ -1,4 +1,3 @@
-import asyncio
 import json
 import random
 import re
@@ -7,8 +6,10 @@ from typing import Optional
 import anthropic
 from playwright.async_api import Page
 
-from .config import AppConfig
-from .models import Listing
+from ..utils.browser import BaseScraper
+from ..utils.config import AppConfig
+from ..utils.models import Listing
+from ..utils.parsing import requires_wbs, parse_german_number, parse_facts
 
 IMMOWELT_BASE = "https://www.immowelt.de"
 # Do NOT navigate here directly — Auth0 requires the OAuth flow to be initiated
@@ -34,10 +35,9 @@ CONTACT_FORM = '[data-testid="cdp-contact-form"]'
 CONTACT_SUBMIT = '[data-testid="cdp-contact-form-submit.email"]'
 
 
-class ImmoweltScraper:
+class ImmoweltScraper(BaseScraper):
     def __init__(self, page: Page, config: AppConfig):
-        self.page = page
-        self.config = config
+        super().__init__(page, config)
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -79,7 +79,6 @@ class ImmoweltScraper:
         try:
             await self.page.wait_for_url(f"**/{_SIGNIN_DOMAIN}/**", timeout=15000)
         except Exception:
-            # If we never reached the signin domain we may already be logged in
             return _SIGNIN_DOMAIN not in self.page.url and "immowelt.de" in self.page.url
 
         await self._delay()
@@ -101,7 +100,7 @@ class ImmoweltScraper:
             return False
 
         await self._human_type(username_field, self.config.email)
-        await self._delay(1000, 5000)  # pause between fields like a real user
+        await self._delay(1000, 5000)
 
         password_field = self.page.locator('input[name="password"]')
         await password_field.wait_for(state="visible", timeout=10000)
@@ -129,7 +128,6 @@ class ImmoweltScraper:
         ]
         for url in warmup_urls:
             await self.page.goto(url, wait_until="domcontentloaded")
-            # Scroll partway down like a reader would
             scroll = random.randint(300, 800)
             await self.page.evaluate(f"window.scrollBy(0, {scroll})")
             await self._delay(3000, 7000)
@@ -138,7 +136,6 @@ class ImmoweltScraper:
         url = self._build_search_url()
         await self.page.goto(url, wait_until="domcontentloaded")
         await self._delay(2000, 4000)
-        # Scroll to trigger lazy-loaded cards, then wait for them
         await self.page.evaluate("window.scrollBy(0, 600)")
         await self._delay(1500, 2500)
 
@@ -175,13 +172,12 @@ class ImmoweltScraper:
         await self._delay(2000, 6000)
         await self.page.goto(listing.url, wait_until="domcontentloaded")
         await self._delay(1500, 3000)
-        # Scroll down naturally before reading description
         await self.page.evaluate(f"window.scrollBy(0, {random.randint(200, 500)})")
         await self._delay(1000, 2500)
         try:
             desc = await self.page.locator(DESCRIPTION_SELECTOR).inner_text(timeout=5000)
             listing.description = desc.strip()
-            if _requires_wbs(listing.description):
+            if requires_wbs(listing.description):
                 listing.wbs_required = True
         except Exception:
             pass
@@ -191,7 +187,6 @@ class ImmoweltScraper:
         await self.page.goto(listing.url, wait_until="domcontentloaded")
         await self._delay(2000, 5000)
 
-        # Clicking contact opens a modal popup
         await self._click_first([CONTACT_SCROLL_BTN, 'button:has-text("Kontaktieren")'])
         await self._delay(1500, 2500)
 
@@ -201,7 +196,6 @@ class ImmoweltScraper:
         try:
             await container.wait_for(state="visible", timeout=6000)
         except Exception:
-            # No dialog role — fall back to the form's own testid
             container = self.page.locator(CONTACT_FORM).first
 
         msg_field = container.locator('textarea[name="message"]').first
@@ -209,12 +203,10 @@ class ImmoweltScraper:
             await msg_field.wait_for(state="visible", timeout=5000)
         except Exception:
             return False
-        # Clear any pre-filled text then set the full message instantly (no keystroke delay)
         await msg_field.fill("")
         await msg_field.fill(message)
         await self._delay(300, 600)
 
-        # Fill personal details only if the fields are empty
         u = self.config.user
         parts = u.name.split(" ", 1)
         for field_name, value in [
@@ -231,9 +223,7 @@ class ImmoweltScraper:
             except Exception:
                 pass
 
-        # Handle any extra fields this listing's form might require
         await self._fill_extra_fields(container)
-
         await self._delay(1000, 3000)
 
         submit = container.locator(CONTACT_SUBMIT)
@@ -258,20 +248,18 @@ class ImmoweltScraper:
         if listing.wbs_required:
             return False
 
-        # Warm rent is always higher than cold rent, so if the displayed price
-        # (Kaltmiete or Warmmiete) already exceeds max_rent, it's over budget.
         if listing.rent and listing.rent != "Preis auf Anfrage":
-            rent_val = _parse_german_number(listing.rent)
+            rent_val = parse_german_number(listing.rent)
             if rent_val is not None and rent_val > f.max_rent:
                 return False
 
         if listing.size:
-            size_val = _parse_german_number(listing.size)
+            size_val = parse_german_number(listing.size)
             if size_val is not None and size_val < f.min_size:
                 return False
 
         if listing.rooms:
-            rooms_val = _parse_german_number(listing.rooms)
+            rooms_val = parse_german_number(listing.rooms)
             if rooms_val is not None and rooms_val < f.min_rooms:
                 return False
 
@@ -282,7 +270,7 @@ class ImmoweltScraper:
         to fill, and fill them. This handles per-listing variation automatically."""
         known_names = {"message", "firstName", "lastName", "email"}
 
-        candidates: list[tuple] = []  # (locator, field_dict)
+        candidates: list[tuple] = []
 
         all_els = await container.locator(
             'input:not([type="hidden"]):not([type="submit"])'
@@ -360,8 +348,6 @@ class ImmoweltScraper:
                 print(f"[warn] Could not fill {info['id']!r}: {e}")
 
     def _ask_claude_for_field_values(self, fields: list[dict]) -> dict[str, str]:
-        """Ask Claude what value to use for each unknown form field.
-        Returns a dict mapping field id → value to enter."""
         u = self.config.user
         fields_desc = "\n".join(
             "  - id={id!r} label={label!r} placeholder={placeholder!r} type={type!r}".format(**f)
@@ -398,7 +384,6 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        # Strip markdown code fences if present
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
         try:
             return json.loads(raw)
@@ -449,7 +434,7 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
         rent = await self._text(card, CARD_PRICE) or "Preis auf Anfrage"
         facts = await self._text(card, CARD_FACTS) or ""
         address = await self._text(card, CARD_ADDRESS) or "Berlin"
-        rooms, size = _parse_facts(facts)
+        rooms, size = parse_facts(facts)
 
         return Listing(
             id=listing_id,
@@ -459,7 +444,7 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
             size=size,
             rooms=rooms,
             address=address.strip(),
-            wbs_required=_requires_wbs(raw_title),
+            wbs_required=requires_wbs(raw_title),
         )
 
     async def _accept_cookies(self) -> None:
@@ -487,7 +472,6 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
         except Exception:
             pass
 
-        # Fallback: standard visible selectors (non-shadow-DOM consent banners)
         for sel in [
             '[data-testid="uc-accept-all-button"]',
             'button:has-text("Alle akzeptieren")',
@@ -501,17 +485,6 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
                     return
             except Exception:
                 continue
-
-    async def _click_first(self, selectors: list[str]) -> bool:
-        for sel in selectors:
-            try:
-                el = self.page.locator(sel).first
-                if await el.is_visible(timeout=3000):
-                    await el.click()
-                    return True
-            except Exception:
-                continue
-        return False
 
     async def _find_first(self, selectors: list[str]):
         for sel in selectors:
@@ -530,79 +503,14 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
         except Exception:
             return ""
 
-    @staticmethod
-    async def _delay(min_ms: int = 600, max_ms: int = 1400) -> None:
-        await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
-
-    @staticmethod
-    async def _human_type(field, text: str) -> None:
-        """Type text character by character with per-keystroke jitter (60–180 ms)."""
-        await field.click()
-        for ch in text:
-            await field.type(ch)
-            await asyncio.sleep(random.uniform(0.06, 0.18))
-
-
-_WBS_NOT_REQUIRED = re.compile(
-    r"kein\w*\s+WBS"
-    r"|ohne\s+WBS"
-    r"|WBS\s+(?:ist\s+)?nicht\s+\w+"
-    r"|kein\w*\s+Wohnberechtigungsschein"
-    r"|ohne\s+Wohnberechtigungsschein",
-    re.IGNORECASE,
-)
-_WBS_REQUIRED = re.compile(r"\bWBS\b|Wohnberechtigungsschein", re.IGNORECASE)
-
 
 def _extract_title(raw: str) -> str:
-    """Pull the listing-type line out of the card's multi-line description blob.
-
-    The card title selector returns a block like:
-      "1.659 €\\nKaltmiete\\nWohnung zur Miete - Erstbezug\\n3 Zimmer\\n..."
-    We want only the human-readable type line (the one with 'zur Miete' / 'zu vermieten').
-    """
+    """Pull the listing-type line out of the card's multi-line description blob."""
     lines = [l.strip() for l in raw.splitlines() if l.strip() and l.strip() != "·"]
     for line in lines:
         if "zur Miete" in line or "zu vermieten" in line:
             return line
-    # Fallback: first line that isn't a price, unit, or separator
     for line in lines:
         if not re.match(r'^[\d.,\s€m²]+$', line) and line not in ("Kaltmiete", "Warmmiete"):
             return line
     return lines[0] if lines else raw.strip()
-
-
-def _requires_wbs(text: str) -> bool:
-    if _WBS_NOT_REQUIRED.search(text):
-        return False
-    return bool(_WBS_REQUIRED.search(text))
-
-
-def _parse_german_number(text: str) -> Optional[float]:
-    """Parse a German-formatted number from a string.
-
-    German format: '1.200,50' means 1200.50 (dot = thousands sep, comma = decimal).
-    Strips currency symbols, m², 'Zimmer', etc. before parsing.
-    Returns None if no number is found.
-    """
-    m = re.search(r"([\d]+(?:\.[\d]{3})*(?:,[\d]+)?)", text)
-    if not m:
-        return None
-    raw = m.group(1)
-    raw = raw.replace(".", "").replace(",", ".")
-    try:
-        return float(raw)
-    except ValueError:
-        return None
-
-
-def _parse_facts(text: str) -> tuple[str, str]:
-    rooms = ""
-    size = ""
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:Zi\b|Zimmer)", text)
-    if m:
-        rooms = m.group(1)
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", text)
-    if m:
-        size = f"{m.group(1)} m²"
-    return rooms, size
