@@ -101,7 +101,8 @@ All configuration lives in `.env`. Copy `.env.example` to get started.
 | `USER_NAME` | yes | Your full name |
 | `USER_OCCUPATION` | yes | Job title used in the message |
 | `USER_INCOME_MONTHLY` | yes | Net monthly income in € |
-| `USER_HOUSEHOLD_SIZE` | no | Number of people moving in (default: 1) |
+| `USER_HOUSEHOLD_SIZE` | no | Total number of people moving in (default: 1) |
+| `USER_CHILDREN` | no | Number of children in the household (default: 0) |
 | `USER_MOVE_IN_DATE` | no | Preferred move-in date (default: `flexibel`) |
 | `USER_PHONE` | no | Phone number for contact forms |
 | `USER_STREET` | no | Current street name |
@@ -115,6 +116,39 @@ All configuration lives in `.env`. Copy `.env.example` to get started.
 | `APPLY_PREMIUM` | no | Apply to Suchen+/MieterPlus listings on IS24 (default: false) |
 
 Search results are currently hardcoded to **Berlin**. To change the city, update `SEARCH_MIN_ROOMS` and the city slug in `_build_search_url()` inside the relevant scraper.
+
+## Docker
+
+Both bots share a single image. The `docker-compose.yml` defines them as separate services, each with its own volume for the browser profile.
+
+**Build the image (once):**
+```bash
+docker compose build
+```
+
+The first build takes a few minutes — Playwright downloads Firefox (~300 MB) and installs its system libraries during the build so the image is self-contained.
+
+**Run Immowelt:**
+```bash
+docker compose run --rm immowelt
+```
+
+**Run ImmobilienScout24:**
+```bash
+docker compose run --rm immoscout
+```
+
+`--rm` removes the container after it exits; the browser profile is preserved in the named volume.
+
+**Why `run` instead of `up`?** Both services are interactive — you approve each application at the terminal and may need to paste an OTP code. `docker compose run` attaches your terminal directly. `docker compose up` is designed for background daemons.
+
+**Browser profiles** are bind-mounted from the repo root (`./browser_profile` and `./browser_profile_immoscout`). They persist across runs so the bot stays logged in. If you ever need to log in fresh, just delete the relevant directory:
+```bash
+rm -rf browser_profile/          # Immowelt
+rm -rf browser_profile_immoscout/ # IS24
+```
+
+**How headless=False works in Docker:** The container runs [Xvfb](https://en.wikipedia.org/wiki/Xvfb) (a virtual framebuffer) so Firefox gets a real display to render into even without a monitor. The browser behaves identically to running locally — same fingerprint, same bot-detection profile.
 
 ## Debugging selectors
 

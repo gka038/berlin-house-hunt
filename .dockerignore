@@ -1,0 +1,15 @@
+.git/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Browser profiles contain session data and can be hundreds of MB
+browser_profile/
+browser_profile_immoscout/
+
+# Secrets — passed at runtime via --env-file
+.env
+
+# Debug screenshots
+/tmp/

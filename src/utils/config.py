@@ -11,6 +11,7 @@ class UserProfile:
     occupation: str
     income_monthly: int
     household_size: int
+    children: int
     move_in_date: str
     phone: str
     about_me: str
@@ -50,6 +51,7 @@ def load_config() -> AppConfig:
             occupation=_require("USER_OCCUPATION"),
             income_monthly=int(_require("USER_INCOME_MONTHLY")),
             household_size=int(os.getenv("USER_HOUSEHOLD_SIZE", "1")),
+            children=int(os.getenv("USER_CHILDREN", "0")),
             move_in_date=os.getenv("USER_MOVE_IN_DATE", "flexibel"),
             phone=os.getenv("USER_PHONE", ""),
             about_me=os.getenv("USER_ABOUT_ME", ""),

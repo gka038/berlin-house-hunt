@@ -51,20 +51,17 @@ class ImmoweltScraper(BaseScraper):
         await self._accept_cookies()
 
         # If the persistent profile has a live session, the header shows a user
-        # avatar / profile link instead of the "Anmelden" button.  Detect that
-        # and skip the full OAuth dance.
-        already_logged_in_selectors = [
-            '[data-testid="header-profile-button"]',
-            '[data-testid="header-user-menu"]',
-            '[data-testid*="profile"]',
-            'a[href*="/mein-immowelt/profil"]',
-        ]
-        for sel in already_logged_in_selectors:
-            try:
-                if await self.page.locator(sel).first.is_visible(timeout=2000):
-                    return True
-            except Exception:
-                pass
+        # avatar / profile link instead of the "Anmelden" button. Check all
+        # indicators at once so we don't burn up to 8 s on sequential timeouts.
+        try:
+            if await self.page.locator(
+                '[data-testid="header-profile-button"],'
+                '[data-testid="header-user-menu"],'
+                'a[href*="/mein-immowelt/profil"]'
+            ).first.is_visible(timeout=3000):
+                return True
+        except Exception:
+            pass
 
         login_btn_selectors = [
             '[data-testid="login-button"]',
@@ -190,11 +187,11 @@ class ImmoweltScraper(BaseScraper):
         await self._click_first([CONTACT_SCROLL_BTN, 'button:has-text("Kontaktieren")'])
         await self._delay(1500, 2500)
 
-        # Scope all interactions to the modal dialog so we don't confuse
-        # fields in the popup with any background form on the page.
+        # Immowelt's contact form is inline — there is no dialog. Try dialog
+        # briefly in case a future redesign adds one, then fall back immediately.
         container = self.page.locator('[role="dialog"]').first
         try:
-            await container.wait_for(state="visible", timeout=6000)
+            await container.wait_for(state="visible", timeout=800)
         except Exception:
             container = self.page.locator(CONTACT_FORM).first
 
@@ -218,13 +215,16 @@ class ImmoweltScraper(BaseScraper):
                 field = container.locator(f'input[name="{field_name}"]').first
                 if await field.is_visible(timeout=2000):
                     if not await field.input_value():
-                        await self._human_type(field, value)
-                        await self._delay(500, 2000)
+                        await field.fill(value)
+                        await self._delay(100, 300)
             except Exception:
                 pass
 
+        # Handle the well-known structured fields deterministically, then fall
+        # back to Claude only for fields that are genuinely novel.
+        await self._fill_structured_fields(container)
         await self._fill_extra_fields(container)
-        await self._delay(1000, 3000)
+        await self._delay(400, 800)
 
         submit = container.locator(CONTACT_SUBMIT)
         if not await submit.count():
@@ -265,9 +265,117 @@ class ImmoweltScraper(BaseScraper):
 
         return True
 
+    async def _fill_structured_fields(self, container) -> None:
+        """Fill the well-known structured fields Immowelt includes on most contact
+        forms, identified by their German label text rather than field names
+        (which vary per listing). Falls through silently for any field not found."""
+        u = self.config.user
+
+        # Dropdowns: (label keyword, preferred option texts in priority order)
+        select_fields = [
+            ("Haustiere",        ["Nein"]),
+            ("Beschäftigungsart", ["Angestellt", "Angestellte", "Vollzeit", "Arbeitnehmer"]),
+            ("gewerbliche",      ["Nein"]),
+            ("Mietrückstände",   ["Nein"]),
+            ("Insolvenz",        ["Nein"]),
+            ("Raucher",          ["Nein", "Nichtraucher"]),
+        ]
+        for keyword, preferred in select_fields:
+            await self._select_by_label(container, keyword, preferred)
+
+        # Text inputs: (label keyword, value)
+        input_fields = [
+            ("Kinder",   str(u.children)),
+            ("Personen", str(u.household_size)),
+            ("Bewohner", str(u.household_size)),
+        ]
+        for keyword, value in input_fields:
+            await self._input_by_label(container, keyword, value)
+
+        # Opt out of the moving-company marketing checkbox.
+        await self._uncheck_by_label(container, "Umzugsfirmen")
+
+    async def _get_field_label(self, el) -> str:
+        try:
+            return await el.evaluate("""e => {
+                if (e.id) {
+                    const l = document.querySelector('label[for="' + e.id + '"]');
+                    if (l) return l.innerText.trim();
+                }
+                const p = e.closest('label');
+                if (p) {
+                    const clone = p.cloneNode(true);
+                    clone.querySelectorAll('input,select,textarea').forEach(n => n.remove());
+                    return clone.innerText.trim();
+                }
+                let sib = e.previousElementSibling;
+                while (sib) {
+                    if (['LABEL','SPAN','P','DIV'].includes(sib.tagName) && sib.innerText.trim())
+                        return sib.innerText.trim();
+                    sib = sib.previousElementSibling;
+                }
+                return '';
+            }""")
+        except Exception:
+            return ""
+
+    async def _select_by_label(self, container, keyword: str, preferred: list[str]) -> None:
+        try:
+            for sel_el in await container.locator("select").all():
+                if not await sel_el.is_visible(timeout=500):
+                    continue
+                label = await self._get_field_label(sel_el)
+                if keyword.lower() not in label.lower():
+                    continue
+                options = await sel_el.evaluate(
+                    "e => Array.from(e.options).map(o => ({v: o.value, t: o.text.trim()}))"
+                )
+                for pref in preferred:
+                    for opt in options:
+                        if pref.lower() in opt["t"].lower():
+                            await sel_el.select_option(value=opt["v"])
+                            await self._delay(80, 150)
+                            print(f"[form] {label.splitlines()[0]!r} → {opt['t']!r}")
+                            return
+        except Exception:
+            pass
+
+    async def _input_by_label(self, container, keyword: str, value: str) -> None:
+        try:
+            selector = (
+                'input:not([type="hidden"]):not([type="submit"])'
+                ':not([type="button"]):not([type="checkbox"]):not([type="radio"])'
+            )
+            for inp_el in await container.locator(selector).all():
+                if not await inp_el.is_visible(timeout=500):
+                    continue
+                label = await self._get_field_label(inp_el)
+                if keyword.lower() not in label.lower():
+                    continue
+                if not await inp_el.input_value():
+                    await inp_el.fill(value)
+                    await self._delay(80, 150)
+                    print(f"[form] {label.splitlines()[0]!r} → {value!r}")
+                return
+        except Exception:
+            pass
+
+    async def _uncheck_by_label(self, container, keyword: str) -> None:
+        try:
+            for cb in await container.locator('input[type="checkbox"]').all():
+                label = await self._get_field_label(cb)
+                if keyword.lower() in label.lower():
+                    if await cb.is_checked():
+                        await cb.uncheck()
+                        await self._delay(80, 150)
+                        print(f"[form] Unchecked {label.splitlines()[0]!r}")
+                    return
+        except Exception:
+            pass
+
     async def _fill_extra_fields(self, container) -> None:
-        """Discover any non-standard visible fields in the form, ask Claude what
-        to fill, and fill them. This handles per-listing variation automatically."""
+        """Discover any remaining visible fields not yet handled, ask Claude what
+        to fill, and fill them. This catches per-listing variation automatically."""
         known_names = {"message", "firstName", "lastName", "email"}
 
         candidates: list[tuple] = []
@@ -284,6 +392,9 @@ class ImmoweltScraper(BaseScraper):
                     continue
                 name = (await el.get_attribute("name")) or ""
                 if name in known_names:
+                    continue
+                # Skip fields already filled by _fill_structured_fields.
+                if await el.input_value():
                     continue
                 tag = await el.evaluate("e => e.tagName.toLowerCase()")
                 el_type = (await el.get_attribute("type")) or "text"

@@ -1,0 +1,22 @@
+services:
+  immowelt:
+    build: .
+    image: rental-bot
+    command: immowelt
+    env_file: .env
+    # stdin_open + tty: required for the CLI approval loop and OTP prompts.
+    stdin_open: true
+    tty: true
+    volumes:
+      # Persist the Firefox session so login cookies survive between runs.
+      - ./browser_profile:/app/browser_profile
+
+  immoscout:
+    build: .
+    image: rental-bot
+    command: immoscout
+    env_file: .env
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./browser_profile_immoscout:/app/browser_profile_immoscout

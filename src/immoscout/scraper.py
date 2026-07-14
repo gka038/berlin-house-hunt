@@ -62,22 +62,16 @@ class ImmoscoutScraper(BaseScraper):
         await self._delay(800, 1500)
         await self._accept_cookies()
 
-        # Click the account link — if logged in it goes to /meinkonto/dashboard/,
-        # if not logged in it redirects to the SSO login page.
-        account_link = self.page.locator('a[href*="geschlossenerbereich"]').first
-        try:
-            if await account_link.is_visible(timeout=3000):
-                print(f"[login] Clicking account link to detect session state…")
-                await account_link.click()
-                await self.page.wait_for_load_state("domcontentloaded")
-                await self._delay(800, 1500)
-        except Exception:
-            pass
-
+        # Fast-path: navigate to the account dashboard. IS24 redirects to SSO
+        # when the session has expired, so the resulting URL tells us everything
+        # without needing to find and click an account link.
+        await self.page.goto(f"{IMMOSC_BASE}/meinkonto/dashboard/", wait_until="domcontentloaded")
+        await self._delay(800, 1500)
         if "meinkonto" in self.page.url or "dashboard" in self.page.url:
             print("[login] Already logged in.")
             return True
 
+        # We were redirected — ensure we're on SSO before filling credentials.
         if _SIGNIN_DOMAIN not in self.page.url:
             print(f"[login] Unexpected URL {self.page.url!r}, navigating to SSO directly…")
             await self.page.goto(_LOGIN_URL, wait_until="domcontentloaded")
@@ -277,10 +271,9 @@ class ImmoscoutScraper(BaseScraper):
             try:
                 field = container.locator(f'input[name="{field_name}"]').first
                 if await field.is_visible(timeout=2000):
-                    current = await field.input_value()
-                    if not current:
-                        await self._human_type(field, value)
-                        await self._delay(300, 800)
+                    if not await field.input_value():
+                        await field.fill(value)
+                        await self._delay(80, 150)
             except Exception:
                 pass
 
@@ -288,7 +281,7 @@ class ImmoscoutScraper(BaseScraper):
         await self._fill_select(container, "salutation", ["Herr"])
         if u.household_size:
             await self._fill_input_if_empty(container, "numberOfAdults", str(u.household_size))
-        await self._fill_input_if_empty(container, "numberOfKids", "0")
+        await self._fill_input_if_empty(container, "numberOfKids", str(u.children))
         if u.income_monthly:
             await self._fill_input_if_empty(container, "incomeAmount", str(int(u.income_monthly)))
         await self._fill_select(container, "employmentStatus", ["Angestellt", "Angestellte", "Arbeitnehmer"])
@@ -320,12 +313,12 @@ class ImmoscoutScraper(BaseScraper):
                         await cb.check()
                 except Exception:
                     await cb_frame.click()
-                await self._delay(200, 400)
+                await self._delay(80, 150)
         except Exception:
             pass
 
         await self._fill_extra_fields(container)
-        await self._delay(800, 2000)
+        await self._delay(400, 800)
 
         # IS24's React form initialises privacyPolicyAccepted=false and there is no
         # DOM checkbox that sets it to true — intercept the POST and patch it.
@@ -409,7 +402,7 @@ class ImmoscoutScraper(BaseScraper):
             url = base_url + hash_suffix
             print(f"[apply] Trying contact URL: {url}")
             await self.page.goto(url, wait_until="domcontentloaded")
-            await self._delay(2000, 3500)
+            await self._delay(1200, 2000)
             print(f"[apply] Landed on: {self.page.url}")
 
             if await self.page.locator(PREMIUM_WALL).count():
@@ -500,7 +493,7 @@ class ImmoscoutScraper(BaseScraper):
                     if not await cb.is_checked():
                         await cb.click()
                     print(f"[apply] Privacy policy checked (name={name!r})")
-                    await self._delay(200, 400)
+                    await self._delay(80, 150)
                     return
             except Exception:
                 pass
@@ -516,7 +509,7 @@ class ImmoscoutScraper(BaseScraper):
                     else:
                         await label.click()
                     print(f"[apply] Privacy policy accepted via label ({phrase!r})")
-                    await self._delay(200, 400)
+                    await self._delay(80, 150)
                     return
             except Exception:
                 pass
@@ -542,7 +535,7 @@ class ImmoscoutScraper(BaseScraper):
             }""")
             if accepted:
                 print(f"[apply] Privacy policy accepted via JS event dispatch")
-                await self._delay(300, 500)
+                await self._delay(80, 150)
                 return
         except Exception:
             pass
@@ -875,12 +868,12 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
                 for opt in options:
                     if pref.lower() in opt["t"].lower():
                         await sel.select_option(value=opt["v"])
-                        await self._delay(200, 500)
+                        await self._delay(80, 150)
                         return
             for opt in options:
                 if opt["v"]:
                     await sel.select_option(value=opt["v"])
-                    await self._delay(200, 500)
+                    await self._delay(80, 150)
                     return
         except Exception:
             pass
@@ -891,7 +884,7 @@ Example: {{"salutation": "Herr", "phone": "+4917627752034"}}"""
             if await field.is_visible(timeout=1500):
                 if not await field.input_value():
                     await field.fill(value)
-                    await self._delay(200, 400)
+                    await self._delay(80, 150)
         except Exception:
             pass
 
