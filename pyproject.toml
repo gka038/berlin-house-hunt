@@ -1,0 +1,24 @@
+[project]
+name = "rental-bot"
+version = "0.2.0"
+description = "Automated rental applications for Immowelt and ImmobilienScout24"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.45",
+    "haystack-ai>=2.3",
+    "anthropic>=0.40",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+immowelt = "src.main:run"
+immoscout = "src.immoscout_main:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

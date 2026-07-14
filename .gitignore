@@ -1,0 +1,4 @@
+.env
+*.pyc
+browser_profile
+browser_profile_immoscout
